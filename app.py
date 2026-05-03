@@ -89,13 +89,24 @@ def transcribe_audio(groq_client: Groq, file_bytes: bytes, ext: str, language: s
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
-        with open(tmp_path, "rb") as af:
-            result = groq_client.audio.transcriptions.create(
-                model="whisper-large-v3",
-                file=af,
-                response_format="verbose_json",
-                language=language,
-            )
+        import time
+        result = None
+        for _attempt in range(3):
+            try:
+                with open(tmp_path, "rb") as af:
+                    result = groq_client.audio.transcriptions.create(
+                        model="whisper-large-v3",
+                        file=af,
+                        response_format="verbose_json",
+                        language=language,
+                    )
+                break
+            except Exception as _e:
+                if _attempt < 2:
+                    time.sleep(5)
+                else:
+                    os.unlink(tmp_path)
+                    raise
         os.unlink(tmp_path)
         segs = getattr(result, "segments", None) or []
         lines = []
@@ -121,20 +132,31 @@ def transcribe_audio(groq_client: Groq, file_bytes: bytes, ext: str, language: s
     for i in range(n_chunks):
         chunk   = audio[i * chunk_ms : (i + 1) * chunk_ms]
         buf     = io.BytesIO()
-        chunk.export(buf, format="mp3")
+        chunk.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
         buf.seek(0)
         chunk_bytes = buf.read()
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             tmp.write(chunk_bytes)
             tmp_path = tmp.name
-        with open(tmp_path, "rb") as af:
-            result = groq_client.audio.transcriptions.create(
-                model="whisper-large-v3",
-                file=af,
-                response_format="verbose_json",
-                language=language,
-            )
+        import time
+        result = None
+        for _attempt in range(3):
+            try:
+                with open(tmp_path, "rb") as af:
+                    result = groq_client.audio.transcriptions.create(
+                        model="whisper-large-v3",
+                        file=af,
+                        response_format="verbose_json",
+                        language=language,
+                    )
+                break
+            except Exception as _e:
+                if _attempt < 2:
+                    time.sleep(5)
+                else:
+                    os.unlink(tmp_path)
+                    raise
         os.unlink(tmp_path)
         segs = getattr(result, "segments", None) or []
         chunk_lines = []
