@@ -372,7 +372,7 @@ if file_ok and generate_clicked:
 
             if size_mb > GROQ_CHUNK_LIMIT_MB:
                 n_chunks = math.ceil(size_mb / GROQ_CHUNK_LIMIT_MB)
-                st.write(f"Large file ({size_mb:.1f} MB) — splitting into ~{n_chunks} chunks…")
+                st.write(f"Large file ({size_mb:.1f} MB) — compressing and transcribing…")
 
             srt_content = transcribe_audio(groq_client, file_bytes, ext, language)
             step1.update(label="✅ Step 1 — Transcription complete!", state="complete")
