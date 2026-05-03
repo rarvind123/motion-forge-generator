@@ -1,11 +1,13 @@
 import streamlit as st
 from openai import OpenAI
 from groq import Groq
+from pydub import AudioSegment
 import json
 import tempfile
 import os
 import re
 import math
+import io
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -31,7 +33,6 @@ st.markdown("""
 st.markdown("""
 <div class="hero">
   <h1>🎬 Motion Forge Script Generator</h1>
-  <p>Upload your episode audio → time-coded Morphic prompt script + Character & Location sheets</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -47,6 +48,97 @@ except KeyError as e:
 CLAUDE_MODEL = "anthropic/claude-sonnet-4-5"   # via OpenRouter
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+GROQ_CHUNK_LIMIT_MB = 23   # Stay under Groq's 25 MB limit per request
+
+def shift_srt_timestamps(srt_text: str, offset_ms: int) -> str:
+    """Shift all timestamps in an SRT string by offset_ms milliseconds."""
+    def shift(t: str) -> str:
+        h, m, rest = t.split(":")
+        s, ms = rest.split(",")
+        total = (int(h)*3600 + int(m)*60 + int(s))*1000 + int(ms) + offset_ms
+        total = max(0, total)
+        h2, rem = divmod(total, 3_600_000)
+        m2, rem = divmod(rem, 60_000)
+        s2, ms2 = divmod(rem, 1_000)
+        return f"{h2:02d}:{m2:02d}:{s2:02d},{ms2:03d}"
+    return re.sub(
+        r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})",
+        lambda m: f"{shift(m.group(1))} --> {shift(m.group(2))}",
+        srt_text,
+    )
+
+
+def renumber_srt(srt_text: str, start: int) -> tuple[str, int]:
+    """Renumber SRT blocks starting from `start`. Returns (new_srt, next_index)."""
+    blocks = [b.strip() for b in srt_text.strip().split("\n\n") if b.strip()]
+    out = []
+    for i, block in enumerate(blocks):
+        lines = block.splitlines()
+        lines[0] = str(start + i)
+        out.append("\n".join(lines))
+    return "\n\n".join(out), start + len(blocks)
+
+
+def transcribe_audio(groq_client: Groq, file_bytes: bytes, ext: str, language: str) -> str:
+    """Transcribe audio bytes, chunking automatically if > GROQ_CHUNK_LIMIT_MB."""
+    size_mb = len(file_bytes) / (1024 * 1024)
+
+    if size_mb <= GROQ_CHUNK_LIMIT_MB:
+        # Single request
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as af:
+            result = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=af,
+                response_format="srt",
+                language=language,
+            )
+        os.unlink(tmp_path)
+        return result if isinstance(result, str) else result.text
+
+    # Large file — split into chunks
+    audio = AudioSegment.from_file(io.BytesIO(file_bytes), format=ext)
+    total_ms   = len(audio)
+    # Target chunk duration based on size ratio
+    chunk_ms   = int(total_ms * (GROQ_CHUNK_LIMIT_MB / size_mb) * 0.9)
+    chunk_ms   = min(chunk_ms, 10 * 60 * 1000)   # cap at 10 minutes
+
+    srt_parts      = []
+    offset_ms      = 0
+    next_idx       = 1
+
+    n_chunks = math.ceil(total_ms / chunk_ms)
+    for i in range(n_chunks):
+        chunk   = audio[i * chunk_ms : (i + 1) * chunk_ms]
+        buf     = io.BytesIO()
+        chunk.export(buf, format="mp3")
+        buf.seek(0)
+        chunk_bytes = buf.read()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(chunk_bytes)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as af:
+            result = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=af,
+                response_format="srt",
+                language=language,
+            )
+        os.unlink(tmp_path)
+
+        chunk_srt = result if isinstance(result, str) else result.text
+        if offset_ms > 0:
+            chunk_srt = shift_srt_timestamps(chunk_srt, offset_ms)
+        chunk_srt, next_idx = renumber_srt(chunk_srt, next_idx)
+        srt_parts.append(chunk_srt)
+        offset_ms += chunk_ms   # accumulate offset for next chunk
+
+    return "\n\n".join(srt_parts)
+
 
 def parse_srt(srt_text: str) -> list[dict]:
     segments = []
@@ -198,15 +290,14 @@ with col_upload:
     uploaded_file = st.file_uploader(
         "📁 Upload Episode Audio",
         type=["mp3", "wav", "m4a", "mp4", "ogg", "flac", "webm"],
-        help="Max 25 MB. For longer files, compress to 64 kbps MP3 first.",
+        help="Up to 300 MB. Large files are automatically split and processed in chunks.",
     )
     if uploaded_file:
         size_mb = uploaded_file.size / (1024 * 1024)
-        if size_mb > 25:
-            st.warning(
-                f"⚠️ File is {size_mb:.1f} MB — limit is 25 MB. "
-                "Please compress to 64 kbps MP3 and re-upload."
-            )
+        if size_mb > 300:
+            st.warning(f"⚠️ File is {size_mb:.1f} MB — maximum is 300 MB.")
+        elif size_mb > GROQ_CHUNK_LIMIT_MB:
+            st.info(f"📦 {uploaded_file.name} ({size_mb:.1f} MB) — will be processed in chunks automatically.")
         else:
             st.success(f"✅ {uploaded_file.name}  ({size_mb:.1f} MB) — ready")
 
@@ -227,7 +318,7 @@ with col_meta:
 
     st.markdown("")  # spacer
 
-    file_ok = bool(uploaded_file and (uploaded_file.size / (1024 * 1024)) <= 25)
+    file_ok = bool(uploaded_file and (uploaded_file.size / (1024 * 1024)) <= 300)
 
     generate_clicked = False
     if file_ok:
@@ -253,23 +344,16 @@ if file_ok and generate_clicked:
     srt_content = ""
     with step1:
         try:
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=f".{uploaded_file.name.rsplit('.', 1)[-1]}",
-            ) as tmp:
-                tmp.write(uploaded_file.read())
-                tmp_path = tmp.name
-
+            ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
+            file_bytes = uploaded_file.read()
+            size_mb = len(file_bytes) / (1024 * 1024)
             groq_client = Groq(api_key=groq_key)
-            with open(tmp_path, "rb") as af:
-                result = groq_client.audio.transcriptions.create(
-                    model="whisper-large-v3",
-                    file=af,
-                    response_format="srt",
-                    language=language,
-                )
-            srt_content = result if isinstance(result, str) else result.text
-            os.unlink(tmp_path)
+
+            if size_mb > GROQ_CHUNK_LIMIT_MB:
+                n_chunks = math.ceil(size_mb / GROQ_CHUNK_LIMIT_MB)
+                st.write(f"Large file ({size_mb:.1f} MB) — splitting into ~{n_chunks} chunks…")
+
+            srt_content = transcribe_audio(groq_client, file_bytes, ext, language)
             step1.update(label="✅ Step 1 — Transcription complete!", state="complete")
         except Exception as e:
             step1.update(label="❌ Step 1 — Transcription failed", state="error")
