@@ -81,97 +81,82 @@ def renumber_srt(srt_text: str, start: int) -> tuple[str, int]:
 
 
 def transcribe_audio(groq_client: Groq, file_bytes: bytes, ext: str, language: str) -> str:
-    """Transcribe audio bytes, chunking automatically if > GROQ_CHUNK_LIMIT_MB."""
+    """Transcribe audio. Compresses to MP3 first, then chunks only if still too large."""
+    import time
+
+    def fmt_ts(sec: float) -> str:
+        ms = int(round((sec % 1) * 1000))
+        s  = int(sec)
+        h, rem = divmod(s, 3600)
+        m, s   = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    def call_groq(path: str, offset_sec: float = 0.0, idx_start: int = 1):
+        import time
+        for attempt in range(3):
+            try:
+                with open(path, "rb") as af:
+                    result = groq_client.audio.transcriptions.create(
+                        model="whisper-large-v3",
+                        file=af,
+                        response_format="verbose_json",
+                        language=language,
+                    )
+                segs  = getattr(result, "segments", None) or []
+                lines = []
+                for i, seg in enumerate(segs, idx_start):
+                    t = seg.text.strip()
+                    if t:
+                        lines.append(f"{i}\n{fmt_ts(seg.start+offset_sec)} --> {fmt_ts(seg.end+offset_sec)}\n{t}")
+                return "\n\n".join(lines), idx_start + len(segs)
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(6)
+                else:
+                    raise
+
     size_mb = len(file_bytes) / (1024 * 1024)
 
+    # Step 1: if not MP3, compress the whole file to MP3 first
+    if ext.lower() != "mp3" or size_mb > GROQ_CHUNK_LIMIT_MB:
+        audio = AudioSegment.from_file(io.BytesIO(file_bytes), format=ext)
+        buf = io.BytesIO()
+        audio.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
+        file_bytes = buf.getvalue()
+        ext = "mp3"
+        size_mb = len(file_bytes) / (1024 * 1024)
+
+    # Step 2: if now small enough, send as single request
     if size_mb <= GROQ_CHUNK_LIMIT_MB:
-        # Single request
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
-        import time
-        result = None
-        for _attempt in range(3):
-            try:
-                with open(tmp_path, "rb") as af:
-                    result = groq_client.audio.transcriptions.create(
-                        model="whisper-large-v3",
-                        file=af,
-                        response_format="verbose_json",
-                        language=language,
-                    )
-                break
-            except Exception as _e:
-                if _attempt < 2:
-                    time.sleep(5)
-                else:
-                    os.unlink(tmp_path)
-                    raise
+        srt, _ = call_groq(tmp_path)
         os.unlink(tmp_path)
-        segs = getattr(result, "segments", None) or []
-        lines = []
-        for i, seg in enumerate(segs, 1):
-            def fmt(s):
-                ms=int(round((s%1)*1000)); s=int(s); h,r=divmod(s,3600); m,s=divmod(r,60)
-                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-            lines.append(f"{i}\n{fmt(seg.start)} --> {fmt(seg.end)}\n{seg.text.strip()}")
-        return "\n\n".join(lines)
+        return srt
 
-    # Large file — split into chunks
-    audio = AudioSegment.from_file(io.BytesIO(file_bytes), format=ext)
-    total_ms   = len(audio)
-    # Target chunk duration based on size ratio
-    chunk_ms   = int(total_ms * (GROQ_CHUNK_LIMIT_MB / size_mb) * 0.9)
-    chunk_ms   = min(chunk_ms, 10 * 60 * 1000)   # cap at 10 minutes
+    # Step 3: still too large — chunk the MP3
+    audio    = AudioSegment.from_file(io.BytesIO(file_bytes), format="mp3")
+    total_ms = len(audio)
+    chunk_ms = int(total_ms * (GROQ_CHUNK_LIMIT_MB / size_mb) * 0.9)
+    chunk_ms = min(chunk_ms, 10 * 60 * 1000)
 
-    srt_parts      = []
-    offset_ms      = 0
-    next_idx       = 1
+    srt_parts = []
+    next_idx  = 1
+    n_chunks  = math.ceil(total_ms / chunk_ms)
 
-    n_chunks = math.ceil(total_ms / chunk_ms)
     for i in range(n_chunks):
-        chunk   = audio[i * chunk_ms : (i + 1) * chunk_ms]
-        buf     = io.BytesIO()
+        chunk = audio[i * chunk_ms : (i + 1) * chunk_ms]
+        buf   = io.BytesIO()
         chunk.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
-        buf.seek(0)
-        chunk_bytes = buf.read()
-
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp.write(chunk_bytes)
+            tmp.write(buf.getvalue())
             tmp_path = tmp.name
-        import time
-        result = None
-        for _attempt in range(3):
-            try:
-                with open(tmp_path, "rb") as af:
-                    result = groq_client.audio.transcriptions.create(
-                        model="whisper-large-v3",
-                        file=af,
-                        response_format="verbose_json",
-                        language=language,
-                    )
-                break
-            except Exception as _e:
-                if _attempt < 2:
-                    time.sleep(5)
-                else:
-                    os.unlink(tmp_path)
-                    raise
-        os.unlink(tmp_path)
-        segs = getattr(result, "segments", None) or []
-        chunk_lines = []
         offset_sec = (i * chunk_ms) / 1000.0
-        for seg in segs:
-            def fmt(s):
-                ms=int(round((s%1)*1000)); s=int(s); h,r=divmod(s,3600); m,s=divmod(r,60)
-                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-            start = fmt(seg.start + offset_sec)
-            end   = fmt(seg.end   + offset_sec)
-            chunk_lines.append(f"{next_idx}\n{start} --> {end}\n{seg.text.strip()}")
-            next_idx += 1
-        if chunk_lines:
-            srt_parts.append("\n\n".join(chunk_lines))
-        offset_ms += chunk_ms   # accumulate offset for next chunk
+        chunk_srt, next_idx = call_groq(tmp_path, offset_sec=offset_sec, idx_start=next_idx)
+        os.unlink(tmp_path)
+        if chunk_srt:
+            srt_parts.append(chunk_srt)
 
     return "\n\n".join(srt_parts)
 
