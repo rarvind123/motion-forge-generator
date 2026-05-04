@@ -9,7 +9,7 @@ import math
 import io
 import subprocess
 
-# Page config
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Motion Forge Script Generator",
     page_icon="🎬",
@@ -35,19 +35,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Load API keys
+# ── Load API keys ──────────────────────────────────────────────────────────────
 try:
     openai_key     = st.secrets["OPENAI_API_KEY"]
     openrouter_key = st.secrets["OPENROUTER_API_KEY"]
 except KeyError as e:
-    st.error(f"Missing secret: {e}. Please add it in Streamlit Cloud -> Settings -> Secrets.")
+    st.error(f"Missing secret: {e}. Please add it in Streamlit Cloud → Settings → Secrets.")
     st.stop()
 
 CLAUDE_MODEL = "anthropic/claude-sonnet-4-5"
-CHUNK_SECS   = 300
+CHUNK_SECS   = 300   # 5-minute chunks → each finishes in ~30-60 sec
 
 
-# Helpers
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def seconds_to_srt_time(seconds: float) -> str:
     ms = int(round((seconds % 1) * 1000))
@@ -70,6 +70,7 @@ def verbose_json_to_srt(result, index_start: int = 1, offset_sec: float = 0.0):
 
 
 def extract_script_text(script_file) -> str:
+    """Extract plain text from an uploaded .docx or .txt script file."""
     name = script_file.name.lower()
     raw  = script_file.read()
 
@@ -93,10 +94,14 @@ def extract_script_text(script_file) -> str:
         finally:
             os.unlink(tmp_path)
 
-    return ""
+    return ""  # unsupported type
 
 
 def correct_transcript_with_script(or_client, raw_srt: str, script_text: str) -> str:
+    """Use Claude to fix Whisper mistranscriptions using the original script.
+    Timestamps are preserved exactly; only the dialogue text is corrected."""
+
+    # Send in 80-segment batches to avoid token limits
     blocks = [b for b in raw_srt.strip().split("\n\n") if b.strip()]
     BATCH  = 80
     corrected_blocks = []
@@ -113,8 +118,8 @@ Below is the ORIGINAL SCRIPT the actors read from, followed by the RAW WHISPER T
 
 Your task:
 - Compare each SRT subtitle line against the original script
-- Fix any words that Whisper got wrong (wrong Tamil word, wrong spelling, wrong character name, garbled made-up terms)
-- DO NOT change timestamps -- keep every index number and timestamp exactly as-is
+- Fix any words that Whisper got wrong (wrong Tamil word, wrong spelling, wrong character name, garbled made-up terms like character/creature names)
+- DO NOT change timestamps — keep every index number and timestamp exactly as-is
 - DO NOT add, remove, or merge subtitle blocks
 - DO NOT change correctly transcribed words
 - Return ONLY the corrected SRT text, nothing else
@@ -136,6 +141,8 @@ RAW WHISPER SRT:
 
 def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
                      language: str, progress_cb=None) -> str:
+    """Split audio into 5-min chunks via ffmpeg (disk-only, no Python RAM),
+    transcribe each with OpenAI Whisper, show progress via progress_cb."""
 
     def call_whisper(path: str, offset_sec: float = 0.0, idx_start: int = 1):
         with open(path, "rb") as af:
@@ -145,10 +152,12 @@ def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
             )
         return verbose_json_to_srt(result, index_start=idx_start, offset_sec=offset_sec)
 
+    # Write source to disk
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp_in:
         tmp_in.write(file_bytes)
         src_path = tmp_in.name
 
+    # Get duration via ffprobe
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", src_path],
@@ -157,7 +166,7 @@ def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
     try:
         total_secs = float(probe.stdout.strip())
     except Exception:
-        total_secs = 7200
+        total_secs = 7200  # fallback: 2 hours
 
     n_chunks  = max(1, math.ceil(total_secs / CHUNK_SECS))
     srt_parts = []
@@ -219,11 +228,11 @@ def enrich_srt_in_batches(or_client, segments, progress_bar, batch_size=25):
 
 Add a [MORPHIC] line directly after each subtitle line in this SRT batch.
 
-Each [MORPHIC] prompt must be 1-2 sentences and include:
+Each [MORPHIC] prompt must be 1–2 sentences and include:
 - Visual description of what is happening (characters, objects, setting)
-- Camera movement: slow dolly in, slow dolly out, wide crane shot, handheld follow, static close-up, rack focus, low angle push in, aerial drone pull back, whip pan, slow pan left/right
-- Lighting style: golden hour, harsh shadows, soft diffused, moonlit blue, candlelight, neon, overcast grey
-- Mood keywords: melancholic, tense, joyful, mysterious, epic, intimate, ominous, hopeful
+- Camera movement — one of: slow dolly in, slow dolly out, wide crane shot, handheld follow, static close-up, rack focus, low angle push in, aerial drone pull back, whip pan, slow pan left/right
+- Lighting style — e.g. golden hour, harsh shadows, soft diffused, moonlit blue, candlelight, neon, overcast grey
+- Mood keywords — e.g. melancholic, tense, joyful, mysterious, epic, intimate, ominous, hopeful
 - If a character is mentioned, describe their appearance and action
 
 Return ONLY the annotated SRT text. No JSON, no headers, no extra explanation.
@@ -241,6 +250,20 @@ SRT:
     return "\n\n".join(annotated_parts)
 
 
+def annotated_srt_to_txt(annotated_srt: str) -> str:
+    """Strip SRT index numbers and timestamps, keeping only dialogue and [MORPHIC] lines."""
+    lines_out = []
+    for block in annotated_srt.strip().split("\n\n"):
+        block_lines = block.strip().splitlines()
+        content_lines = [
+            l for l in block_lines
+            if not re.match(r"^\d+$", l.strip()) and "-->" not in l
+        ]
+        if content_lines:
+            lines_out.append("\n".join(content_lines))
+    return "\n\n".join(lines_out)
+
+
 def extract_characters_and_locations(or_client, srt_text: str) -> dict:
     excerpt = srt_text[:12_000]
     prompt  = f"""You are a story analyst and art director. Analyse this SRT transcript from an audio drama episode.
@@ -253,9 +276,9 @@ Return ONLY valid JSON (no markdown fences, no extra text) with this exact struc
       "name": "Character Name",
       "role": "protagonist | antagonist | supporting | narrator",
       "physical_description": "Height, build, hair, eye colour, skin tone, distinguishing features",
-      "costume": "Full clothing - fabric, colour, accessories, footwear, headwear",
-      "personality_notes": "2-3 adjectives capturing their personality",
-      "visual_style_prompt": "Ready-to-paste 1-2 sentence Morphic image prompt for this character"
+      "costume": "Full clothing — fabric, colour, accessories, footwear, headwear",
+      "personality_notes": "2–3 adjectives capturing their personality",
+      "visual_style_prompt": "Ready-to-paste 1–2 sentence Morphic image prompt for this character"
     }}
   ],
   "locations": [
@@ -265,7 +288,7 @@ Return ONLY valid JSON (no markdown fences, no extra text) with this exact struc
       "time_of_day": "morning | afternoon | evening | night | varies",
       "atmosphere": "Overall mood or feel",
       "lighting": "Typical lighting conditions",
-      "visual_style_prompt": "Ready-to-paste 1-2 sentence Morphic image prompt for this location"
+      "visual_style_prompt": "Ready-to-paste 1–2 sentence Morphic image prompt for this location"
     }}
   ]
 }}
@@ -290,7 +313,7 @@ def format_character_sheet(characters, episode_name):
     lines += ["=" * 60, ""]
     for c in characters:
         lines += [
-            f"CHARACTER: {c.get('name', 'Unknown').upper()}", "-" * 40,
+            f"CHARACTER: {c.get('name', 'Unknown').upper()}", "─" * 40,
             f"Role          : {c.get('role', '')}",
             f"Physical      : {c.get('physical_description', '')}",
             f"Costume       : {c.get('costume', '')}",
@@ -307,7 +330,7 @@ def format_locations_sheet(locations, episode_name):
     lines += ["=" * 60, ""]
     for loc in locations:
         lines += [
-            f"LOCATION: {loc.get('name', 'Unknown').upper()}", "-" * 40,
+            f"LOCATION: {loc.get('name', 'Unknown').upper()}", "─" * 40,
             f"Description   : {loc.get('description', '')}",
             f"Time of Day   : {loc.get('time_of_day', '')}",
             f"Atmosphere    : {loc.get('atmosphere', '')}",
@@ -317,36 +340,36 @@ def format_locations_sheet(locations, episode_name):
     return "\n".join(lines)
 
 
-# Main UI
+# ── Main UI ───────────────────────────────────────────────────────────────────
 st.markdown("---")
 col_upload, col_meta = st.columns([3, 2])
 
 with col_upload:
     uploaded_file = st.file_uploader(
-        "Upload Episode Audio",
+        "📁 Upload Episode Audio",
         type=["mp3", "wav", "m4a", "mp4", "ogg", "flac", "webm"],
         help="Up to 300 MB. Automatically split into 5-min chunks for fast transcription.",
     )
     if uploaded_file:
         size_mb = uploaded_file.size / (1024 * 1024)
         if size_mb > 300:
-            st.warning(f"File is {size_mb:.1f} MB - maximum is 300 MB.")
+            st.warning(f"⚠️ File is {size_mb:.1f} MB — maximum is 300 MB.")
         else:
-            st.success(f"{uploaded_file.name}  ({size_mb:.1f} MB) - ready")
+            st.success(f"✅ {uploaded_file.name}  ({size_mb:.1f} MB) — ready")
 
     st.markdown("")
     script_file = st.file_uploader(
-        "Upload Original Script (optional)",
+        "📄 Upload Original Script (optional)",
         type=["docx", "txt"],
         help="Upload the .docx or .txt script used for recording. Claude will use it to fix any Whisper transcription errors.",
     )
     if script_file:
-        st.success(f"Script uploaded: {script_file.name} - transcription will be auto-corrected")
+        st.success(f"✅ Script uploaded: {script_file.name} — transcription will be auto-corrected")
 
 with col_meta:
     episode_name = st.text_input(
         "Episode name (used in filenames)",
-        placeholder="Episode 01 - The Beginning",
+        placeholder="Episode 01 – The Beginning",
     )
     language = st.selectbox(
         "Audio language",
@@ -362,30 +385,31 @@ with col_meta:
     generate_clicked = False
     if file_ok:
         generate_clicked = st.button(
-            "Generate Morphic Script", type="primary", use_container_width=True
+            "🚀 Generate Morphic Script", type="primary", use_container_width=True
         )
     else:
-        st.button("Generate Morphic Script", disabled=True, use_container_width=True)
+        st.button("🚀 Generate Morphic Script", disabled=True, use_container_width=True)
         if not uploaded_file:
             st.caption("Upload an audio file to get started")
 
-# Processing
+# ── Processing ────────────────────────────────────────────────────────────────
 if file_ok and generate_clicked:
 
     safe_name = re.sub(r"[^\w\-]", "_", episode_name) if episode_name else "episode"
     st.markdown("---")
-    st.markdown("#### Processing")
+    st.markdown("#### ⏳ Processing")
 
+    # Read script text upfront if provided
     script_text = ""
     if script_file:
         try:
             script_text = extract_script_text(script_file)
         except Exception as e:
-            st.warning(f"Could not read script file: {e}. Continuing without correction.")
+            st.warning(f"⚠️ Could not read script file: {e}. Continuing without correction.")
             script_text = ""
 
-    # STEP 1 - Transcribe
-    step1 = st.status("Step 1 - Transcribing audio with OpenAI Whisper...", expanded=True)
+    # STEP 1 — Transcribe
+    step1 = st.status("🎙️ Step 1 — Transcribing audio with OpenAI Whisper...", expanded=True)
     srt_content = ""
     with step1:
         try:
@@ -396,61 +420,65 @@ if file_ok and generate_clicked:
 
             est_chunks = max(1, math.ceil(size_mb / 1.2))
             msg_slot   = st.empty()
-            msg_slot.write(f"Splitting into ~{est_chunks} chunks of 5 min each...")
+            msg_slot.write(f"Splitting into ~{est_chunks} chunks of 5 min each…")
 
             def on_chunk(done, total):
-                msg_slot.write(f"Chunk {done}/{total} transcribed...")
+                msg_slot.write(f"✅ Chunk {done}/{total} transcribed…")
 
             srt_content = transcribe_audio(
                 openai_client, file_bytes, ext, language, progress_cb=on_chunk
             )
-            step1.update(label="Step 1 - Transcription complete!", state="complete")
+            step1.update(label="✅ Step 1 — Transcription complete!", state="complete")
         except Exception as e:
-            step1.update(label="Step 1 - Transcription failed", state="error")
+            step1.update(label="❌ Step 1 — Transcription failed", state="error")
             st.error(f"Whisper error: {e}")
             st.stop()
 
-    # STEP 1.5 - Correct transcript using original script
+    # STEP 1.5 — Correct transcript using original script (if provided)
     if script_text:
-        step1b = st.status("Step 1.5 - Correcting transcript against original script...", expanded=True)
+        step1b = st.status("📝 Step 1.5 — Correcting transcript against original script...", expanded=True)
         with step1b:
             try:
                 or_client = OpenAI(
                     base_url="https://openrouter.ai/api/v1", api_key=openrouter_key
                 )
                 n_blocks = len([b for b in srt_content.split("\n\n") if b.strip()])
-                st.write(f"Checking {n_blocks} subtitle blocks for transcription errors...")
+                st.write(f"Checking {n_blocks} subtitle blocks for transcription errors…")
                 srt_content = correct_transcript_with_script(or_client, srt_content, script_text)
-                step1b.update(label="Step 1.5 - Transcript corrected!", state="complete")
+                step1b.update(label="✅ Step 1.5 — Transcript corrected!", state="complete")
             except Exception as e:
-                step1b.update(label="Step 1.5 - Correction skipped", state="error")
+                step1b.update(label="⚠️ Step 1.5 — Correction skipped", state="error")
                 st.warning(f"Script correction failed ({e}), continuing with raw transcript.")
 
-    # STEP 2 - Enrich with Claude
-    step2 = st.status("Step 2 - Generating Morphic prompts with Claude...", expanded=True)
+    # STEP 2 — Enrich with Claude
+    step2 = st.status("🤖 Step 2 — Generating Morphic prompts with Claude...", expanded=True)
     annotated_srt = ""
     with step2:
         try:
             if not script_text:
+                # or_client not yet created if no script was uploaded
                 or_client = OpenAI(
                     base_url="https://openrouter.ai/api/v1", api_key=openrouter_key
                 )
             segments = parse_srt(srt_content)
             total    = len(segments)
-            st.write(f"Found {total} subtitle segments - enriching in batches...")
+            st.write(f"Found **{total} subtitle segments** — enriching in batches…")
             bar = st.progress(0)
             annotated_srt = enrich_srt_in_batches(or_client, segments, bar)
             step2.update(
-                label=f"Step 2 - Morphic prompts added to {total} segments!",
+                label=f"✅ Step 2 — Morphic prompts added to {total} segments!",
                 state="complete",
             )
         except Exception as e:
-            step2.update(label="Step 2 - Enrichment failed", state="error")
+            step2.update(label="❌ Step 2 — Enrichment failed", state="error")
             st.error(f"Claude/OpenRouter error: {e}")
             st.stop()
 
-    # STEP 3 - Extract characters & locations
-    step3 = st.status("Step 3 - Extracting characters, costumes & locations...", expanded=False)
+    # Convert annotated SRT → clean .txt (no index numbers or timestamps)
+    annotated_txt = annotated_srt_to_txt(annotated_srt)
+
+    # STEP 3 — Extract characters & locations
+    step3 = st.status("🎭 Step 3 — Extracting characters, costumes & locations...", expanded=False)
     char_sheet = loc_sheet = ""
     with step3:
         try:
@@ -460,62 +488,62 @@ if file_ok and generate_clicked:
             n_chars    = len(data.get("characters", []))
             n_locs     = len(data.get("locations",  []))
             step3.update(
-                label=f"Step 3 - Found {n_chars} character(s) and {n_locs} location(s)!",
+                label=f"✅ Step 3 — Found {n_chars} character(s) and {n_locs} location(s)!",
                 state="complete",
             )
         except json.JSONDecodeError:
-            step3.update(label="Step 3 - Could not parse JSON", state="error")
+            step3.update(label="⚠️ Step 3 — Could not parse JSON", state="error")
             st.warning("Character & location extraction returned unexpected output. SRT is still available.")
         except Exception as e:
-            step3.update(label="Step 3 - Extraction failed", state="error")
+            step3.update(label="❌ Step 3 — Extraction failed", state="error")
             st.error(f"Error: {e}")
 
-    # Downloads
+    # ── Downloads ──────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Download Your Files")
+    st.markdown("### 📥 Download Your Files")
     dcol1, dcol2, dcol3 = st.columns(3)
 
     with dcol1:
         st.download_button(
-            "Annotated SRT", data=annotated_srt,
-            file_name=f"{safe_name}_morphic.srt", mime="text/plain",
+            "📄 Morphic Script", data=annotated_txt,
+            file_name=f"{safe_name}_morphic.txt", mime="text/plain",
             use_container_width=True,
         )
-        st.caption("Time-coded script with [MORPHIC] camera prompts per line")
+        st.caption("Narration with [MORPHIC] camera prompts per line")
 
     with dcol2:
         if char_sheet:
             st.download_button(
-                "Character & Costume Sheet", data=char_sheet,
+                "👤 Character & Costume Sheet", data=char_sheet,
                 file_name=f"{safe_name}_characters.txt", mime="text/plain",
                 use_container_width=True,
             )
             st.caption("Characters with costume & Morphic prompt fragments")
         else:
-            st.button("Character Sheet", disabled=True, use_container_width=True)
+            st.button("👤 Character Sheet", disabled=True, use_container_width=True)
             st.caption("Not available")
 
     with dcol3:
         if loc_sheet:
             st.download_button(
-                "Locations Sheet", data=loc_sheet,
+                "📍 Locations Sheet", data=loc_sheet,
                 file_name=f"{safe_name}_locations.txt", mime="text/plain",
                 use_container_width=True,
             )
             st.caption("Locations with atmosphere & Morphic prompt fragments")
         else:
-            st.button("Locations Sheet", disabled=True, use_container_width=True)
+            st.button("📍 Locations Sheet", disabled=True, use_container_width=True)
             st.caption("Not available")
 
-    # Preview
+    # ── Preview ────────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Preview")
-    tab_srt, tab_chars, tab_locs = st.tabs(["Annotated SRT", "Characters & Costumes", "Locations"])
+    st.markdown("### 👁️ Preview")
+    tab_srt, tab_chars, tab_locs = st.tabs(["Morphic Script", "Characters & Costumes", "Locations"])
 
     with tab_srt:
-        preview = annotated_srt[:4000]
-        if len(annotated_srt) > 4000:
-            preview += "\n\n... (truncated - download for full file)"
+        preview = annotated_txt[:4000]
+        if len(annotated_txt) > 4000:
+            preview += "\n\n… (truncated — download for full file)"
         st.text_area("", value=preview, height=420, label_visibility="collapsed")
 
     with tab_chars:
