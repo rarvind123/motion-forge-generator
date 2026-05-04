@@ -1,6 +1,5 @@
 import streamlit as st
 from openai import OpenAI
-from groq import Groq
 from pydub import AudioSegment
 import json
 import tempfile
@@ -38,7 +37,7 @@ st.markdown("""
 
 # ── Load API keys from Streamlit secrets ──────────────────────────────────────
 try:
-    groq_key       = st.secrets["GROQ_API_KEY"]
+    openai_key     = st.secrets["OPENAI_API_KEY"]
     openrouter_key = st.secrets["OPENROUTER_API_KEY"]
 except KeyError as e:
     st.error(f"Missing secret: {e}. Please add it in Streamlit Cloud → Settings → Secrets.")
@@ -49,97 +48,70 @@ CLAUDE_MODEL = "anthropic/claude-sonnet-4-5"   # via OpenRouter
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-GROQ_CHUNK_LIMIT_MB = 23   # Stay under Groq's 25 MB limit per request
-
-def shift_srt_timestamps(srt_text: str, offset_ms: int) -> str:
-    """Shift all timestamps in an SRT string by offset_ms milliseconds."""
-    def shift(t: str) -> str:
-        h, m, rest = t.split(":")
-        s, ms = rest.split(",")
-        total = (int(h)*3600 + int(m)*60 + int(s))*1000 + int(ms) + offset_ms
-        total = max(0, total)
-        h2, rem = divmod(total, 3_600_000)
-        m2, rem = divmod(rem, 60_000)
-        s2, ms2 = divmod(rem, 1_000)
-        return f"{h2:02d}:{m2:02d}:{s2:02d},{ms2:03d}"
-    return re.sub(
-        r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})",
-        lambda m: f"{shift(m.group(1))} --> {shift(m.group(2))}",
-        srt_text,
-    )
+WHISPER_CHUNK_LIMIT_MB = 23   # Stay under OpenAI Whisper's 25 MB limit per request
 
 
-def renumber_srt(srt_text: str, start: int) -> tuple[str, int]:
-    """Renumber SRT blocks starting from `start`. Returns (new_srt, next_index)."""
-    blocks = [b.strip() for b in srt_text.strip().split("\n\n") if b.strip()]
-    out = []
-    for i, block in enumerate(blocks):
-        lines = block.splitlines()
-        lines[0] = str(start + i)
-        out.append("\n".join(lines))
-    return "\n\n".join(out), start + len(blocks)
+def seconds_to_srt_time(seconds: float) -> str:
+    """Convert float seconds to SRT timestamp HH:MM:SS,mmm."""
+    ms  = int(round((seconds % 1) * 1000))
+    s   = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def transcribe_audio(groq_client: Groq, file_bytes: bytes, ext: str, language: str) -> str:
-    """Transcribe audio. Compresses to MP3 first, then chunks only if still too large."""
-    import time
+def verbose_json_to_srt(result, index_start: int = 1, offset_sec: float = 0.0) -> tuple[str, int]:
+    """Convert a verbose_json transcription result to SRT text.
+    Returns (srt_text, next_index_start).
+    """
+    lines = []
+    segs  = getattr(result, "segments", None) or []
+    for i, seg in enumerate(segs, start=index_start):
+        start = seconds_to_srt_time(seg.start + offset_sec)
+        end   = seconds_to_srt_time(seg.end   + offset_sec)
+        text  = seg.text.strip()
+        if text:
+            lines.append(f"{i}\n{start} --> {end}\n{text}")
+    return "\n\n".join(lines), index_start + len(segs)
 
-    def fmt_ts(sec: float) -> str:
-        ms = int(round((sec % 1) * 1000))
-        s  = int(sec)
-        h, rem = divmod(s, 3600)
-        m, s   = divmod(rem, 60)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    def call_groq(path: str, offset_sec: float = 0.0, idx_start: int = 1):
-        import time
-        for attempt in range(3):
-            try:
-                with open(path, "rb") as af:
-                    result = groq_client.audio.transcriptions.create(
-                        model="whisper-large-v3",
-                        file=af,
-                        response_format="verbose_json",
-                        language=language,
-                    )
-                segs  = getattr(result, "segments", None) or []
-                lines = []
-                for i, seg in enumerate(segs, idx_start):
-                    t = seg.text.strip()
-                    if t:
-                        lines.append(f"{i}\n{fmt_ts(seg.start+offset_sec)} --> {fmt_ts(seg.end+offset_sec)}\n{t}")
-                return "\n\n".join(lines), idx_start + len(segs)
-            except Exception as e:
-                if attempt < 2:
-                    time.sleep(6)
-                else:
-                    raise
+def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str, language: str) -> str:
+    """Transcribe audio bytes using OpenAI Whisper (no rate limits, pay-per-use).
+    Compresses to mono 64kbps MP3 first, then chunks if still > WHISPER_CHUNK_LIMIT_MB.
+    """
 
+    def call_whisper(path: str, offset_sec: float = 0.0, idx_start: int = 1):
+        with open(path, "rb") as af:
+            result = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=af,
+                response_format="verbose_json",
+                language=language,
+            )
+        return verbose_json_to_srt(result, index_start=idx_start, offset_sec=offset_sec)
+
+    # Step 1 — compress to mono 64kbps MP3 (dramatically reduces file size)
+    audio = AudioSegment.from_file(io.BytesIO(file_bytes), format=ext)
+    buf = io.BytesIO()
+    audio.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
+    file_bytes = buf.getvalue()
+    ext = "mp3"
     size_mb = len(file_bytes) / (1024 * 1024)
 
-    # Step 1: if not MP3, compress the whole file to MP3 first
-    if ext.lower() != "mp3" or size_mb > GROQ_CHUNK_LIMIT_MB:
-        audio = AudioSegment.from_file(io.BytesIO(file_bytes), format=ext)
-        buf = io.BytesIO()
-        audio.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
-        file_bytes = buf.getvalue()
-        ext = "mp3"
-        size_mb = len(file_bytes) / (1024 * 1024)
-
-    # Step 2: if now small enough, send as single request
-    if size_mb <= GROQ_CHUNK_LIMIT_MB:
+    # Step 2 — single request if small enough
+    if size_mb <= WHISPER_CHUNK_LIMIT_MB:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
-        srt, _ = call_groq(tmp_path)
+        srt, _ = call_whisper(tmp_path)
         os.unlink(tmp_path)
         return srt
 
-    # Step 3: still too large — chunk the MP3
+    # Step 3 — chunk if still too large (very long episodes)
     audio    = AudioSegment.from_file(io.BytesIO(file_bytes), format="mp3")
     total_ms = len(audio)
-    chunk_ms = int(total_ms * (GROQ_CHUNK_LIMIT_MB / size_mb) * 0.9)
-    chunk_ms = min(chunk_ms, 10 * 60 * 1000)
+    chunk_ms = int(total_ms * (WHISPER_CHUNK_LIMIT_MB / size_mb) * 0.9)
+    chunk_ms = min(chunk_ms, 10 * 60 * 1000)   # cap at 10 minutes per chunk
 
     srt_parts = []
     next_idx  = 1
@@ -148,12 +120,15 @@ def transcribe_audio(groq_client: Groq, file_bytes: bytes, ext: str, language: s
     for i in range(n_chunks):
         chunk = audio[i * chunk_ms : (i + 1) * chunk_ms]
         buf   = io.BytesIO()
-        chunk.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
+        chunk.export(buf, format="mp3")
+        buf.seek(0)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp.write(buf.getvalue())
+            tmp.write(buf.read())
             tmp_path = tmp.name
-        offset_sec = (i * chunk_ms) / 1000.0
-        chunk_srt, next_idx = call_groq(tmp_path, offset_sec=offset_sec, idx_start=next_idx)
+
+        offset_sec          = (i * chunk_ms) / 1000.0
+        chunk_srt, next_idx = call_whisper(tmp_path, offset_sec=offset_sec, idx_start=next_idx)
         os.unlink(tmp_path)
         if chunk_srt:
             srt_parts.append(chunk_srt)
@@ -317,8 +292,8 @@ with col_upload:
         size_mb = uploaded_file.size / (1024 * 1024)
         if size_mb > 300:
             st.warning(f"⚠️ File is {size_mb:.1f} MB — maximum is 300 MB.")
-        elif size_mb > GROQ_CHUNK_LIMIT_MB:
-            st.info(f"📦 {uploaded_file.name} ({size_mb:.1f} MB) — will be processed in chunks automatically.")
+        elif size_mb > WHISPER_CHUNK_LIMIT_MB:
+            st.info(f"📦 {uploaded_file.name} ({size_mb:.1f} MB) — will be compressed and processed in chunks automatically.")
         else:
             st.success(f"✅ {uploaded_file.name}  ({size_mb:.1f} MB) — ready")
 
@@ -360,21 +335,19 @@ if file_ok and generate_clicked:
     st.markdown("---")
     st.markdown("#### ⏳ Processing")
 
-    # STEP 1 — Transcribe with Groq Whisper
-    step1 = st.status("🎙️ Step 1 — Transcribing audio with Whisper...", expanded=False)
+    # STEP 1 — Transcribe with OpenAI Whisper
+    step1 = st.status("🎙️ Step 1 — Transcribing audio with OpenAI Whisper...", expanded=False)
     srt_content = ""
     with step1:
         try:
             ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
             file_bytes = uploaded_file.read()
             size_mb = len(file_bytes) / (1024 * 1024)
-            groq_client = Groq(api_key=groq_key)
+            openai_client = OpenAI(api_key=openai_key)
 
-            if size_mb > GROQ_CHUNK_LIMIT_MB:
-                n_chunks = math.ceil(size_mb / GROQ_CHUNK_LIMIT_MB)
-                st.write(f"Large file ({size_mb:.1f} MB) — compressing and transcribing…")
+            st.write(f"Compressing {uploaded_file.name} ({size_mb:.1f} MB) → mono MP3…")
 
-            srt_content = transcribe_audio(groq_client, file_bytes, ext, language)
+            srt_content = transcribe_audio(openai_client, file_bytes, ext, language)
             step1.update(label="✅ Step 1 — Transcription complete!", state="complete")
         except Exception as e:
             step1.update(label="❌ Step 1 — Transcription failed", state="error")
