@@ -109,25 +109,22 @@ def correct_transcript_with_script(or_client, raw_srt: str, script_text: str) ->
     for i in range(0, len(blocks), BATCH):
         batch_srt = "\n\n".join(blocks[i : i + BATCH])
 
-        prompt = f"""You are a transcript correction specialist for a multilingual audio drama.
+        prompt = f"""You are a transcript correction specialist for a multilingual audio drama recorded in Tamil (with some English).
 
-The audio was recorded in Tamil (with some English words) and transcribed by OpenAI Whisper.
-Whisper sometimes mishears Tamil words, proper nouns, character names, and made-up terms.
+Whisper often mishears Tamil proper nouns, character names, and made-up terms — for example transcribing a character's name as a completely wrong English phrase. Pay special attention to fixing these.
 
-Below is the ORIGINAL SCRIPT the actors read from, followed by the RAW WHISPER TRANSCRIPT in SRT format.
-
-Your task:
-- Compare each SRT subtitle line against the original script
-- Fix any words that Whisper got wrong (wrong Tamil word, wrong spelling, wrong character name, garbled made-up terms like character/creature names)
+RULES:
+- Fix words/names that Whisper got wrong by comparing against the ORIGINAL SCRIPT
+- Character names and made-up terms (creatures, places, powers) are the most important things to fix
 - DO NOT change timestamps — keep every index number and timestamp exactly as-is
-- DO NOT add, remove, or merge subtitle blocks
+- DO NOT add, remove, or reorder subtitle blocks
 - DO NOT change correctly transcribed words
-- Return ONLY the corrected SRT text, nothing else
+- Return ONLY the corrected SRT text, no explanation, no headers
 
-ORIGINAL SCRIPT:
-{script_text[:8000]}
+ORIGINAL SCRIPT (reference for correct names and words):
+{script_text[:15000]}
 
-RAW WHISPER SRT:
+RAW WHISPER SRT (fix the text, keep the timestamps):
 {batch_srt}"""
 
         resp = or_client.chat.completions.create(
@@ -232,7 +229,7 @@ Each [MORPHIC] prompt must be 1–2 sentences and include:
 - Visual description of what is happening (characters, objects, setting)
 - Camera movement — one of: slow dolly in, slow dolly out, wide crane shot, handheld follow, static close-up, rack focus, low angle push in, aerial drone pull back, whip pan, slow pan left/right
 - Lighting style — e.g. golden hour, harsh shadows, soft diffused, moonlit blue, candlelight, neon, overcast grey
-- Mood keywords — e.g. melancholic, tense, joyful, mysterious, epic, intimate, ominous, hopeful
+- Mood keywords — e.g. melancholia, tense, joyful, mysterious, epic, intimate, ominous, hopeful
 - If a character is mentioned, describe their appearance and action
 
 Return ONLY the annotated SRT text. No JSON, no headers, no extra explanation.
@@ -409,7 +406,7 @@ if file_ok and generate_clicked:
             script_text = ""
 
     # STEP 1 — Transcribe
-    step1 = st.status("🎙️ Step 1 — Transcribing audio with OpenAI Whisper...", expanded=True)
+    step1 = st.status("😙️ Step 1 — Transcribing audio with OpenAI Whisper...", expanded=True)
     srt_content = ""
     with step1:
         try:
@@ -505,11 +502,11 @@ if file_ok and generate_clicked:
 
     with dcol1:
         st.download_button(
-            "📄 Morphic Script", data=annotated_txt,
+            "📄 Morphic Script", data=annotated_srt,
             file_name=f"{safe_name}_morphic.txt", mime="text/plain",
             use_container_width=True,
         )
-        st.caption("Narration with [MORPHIC] camera prompts per line")
+        st.caption("Time-coded narration with [MORPHIC] camera prompts per line")
 
     with dcol2:
         if char_sheet:
@@ -541,8 +538,8 @@ if file_ok and generate_clicked:
     tab_srt, tab_chars, tab_locs = st.tabs(["Morphic Script", "Characters & Costumes", "Locations"])
 
     with tab_srt:
-        preview = annotated_txt[:4000]
-        if len(annotated_txt) > 4000:
+        preview = annotated_srt[:4000]
+        if len(annotated_srt) > 4000:
             preview += "\n\n… (truncated — download for full file)"
         st.text_area("", value=preview, height=420, label_visibility="collapsed")
 
