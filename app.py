@@ -9,7 +9,7 @@ import math
 import io
 import subprocess
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# Page config
 st.set_page_config(
     page_title="Motion Forge Script Generator",
     page_icon="🎬",
@@ -35,19 +35,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Load API keys ──────────────────────────────────────────────────────────────
+# Load API keys
 try:
     openai_key     = st.secrets["OPENAI_API_KEY"]
     openrouter_key = st.secrets["OPENROUTER_API_KEY"]
 except KeyError as e:
-    st.error(f"Missing secret: {e}. Please add it in Streamlit Cloud → Settings → Secrets.")
+    st.error(f"Missing secret: {e}. Please add it in Streamlit Cloud -> Settings -> Secrets.")
     st.stop()
 
-CLAUDE_MODEL       = "anthropic/claude-sonnet-4-5"
-CHUNK_SECS         = 300   # 5-minute chunks → each finishes in ~30-60 sec
+CLAUDE_MODEL = "anthropic/claude-sonnet-4-5"
+CHUNK_SECS   = 300
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 def seconds_to_srt_time(seconds: float) -> str:
     ms = int(round((seconds % 1) * 1000))
@@ -69,10 +69,73 @@ def verbose_json_to_srt(result, index_start: int = 1, offset_sec: float = 0.0):
     return "\n\n".join(lines), index_start + len(segs)
 
 
+def extract_script_text(script_file) -> str:
+    name = script_file.name.lower()
+    raw  = script_file.read()
+
+    if name.endswith(".txt"):
+        for enc in ("utf-8", "utf-16", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    if name.endswith(".docx"):
+        import docx as _docx
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        try:
+            doc   = _docx.Document(tmp_path)
+            lines = [p.text for p in doc.paragraphs if p.text.strip()]
+            return "\n".join(lines)
+        finally:
+            os.unlink(tmp_path)
+
+    return ""
+
+
+def correct_transcript_with_script(or_client, raw_srt: str, script_text: str) -> str:
+    blocks = [b for b in raw_srt.strip().split("\n\n") if b.strip()]
+    BATCH  = 80
+    corrected_blocks = []
+
+    for i in range(0, len(blocks), BATCH):
+        batch_srt = "\n\n".join(blocks[i : i + BATCH])
+
+        prompt = f"""You are a transcript correction specialist for a multilingual audio drama.
+
+The audio was recorded in Tamil (with some English words) and transcribed by OpenAI Whisper.
+Whisper sometimes mishears Tamil words, proper nouns, character names, and made-up terms.
+
+Below is the ORIGINAL SCRIPT the actors read from, followed by the RAW WHISPER TRANSCRIPT in SRT format.
+
+Your task:
+- Compare each SRT subtitle line against the original script
+- Fix any words that Whisper got wrong (wrong Tamil word, wrong spelling, wrong character name, garbled made-up terms)
+- DO NOT change timestamps -- keep every index number and timestamp exactly as-is
+- DO NOT add, remove, or merge subtitle blocks
+- DO NOT change correctly transcribed words
+- Return ONLY the corrected SRT text, nothing else
+
+ORIGINAL SCRIPT:
+{script_text[:8000]}
+
+RAW WHISPER SRT:
+{batch_srt}"""
+
+        resp = or_client.chat.completions.create(
+            model=CLAUDE_MODEL, max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        corrected_blocks.append(resp.choices[0].message.content.strip())
+
+    return "\n\n".join(corrected_blocks)
+
+
 def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
                      language: str, progress_cb=None) -> str:
-    """Split audio into 5-min chunks via ffmpeg (disk-only, no Python RAM),
-    transcribe each with OpenAI Whisper, show progress via progress_cb."""
 
     def call_whisper(path: str, offset_sec: float = 0.0, idx_start: int = 1):
         with open(path, "rb") as af:
@@ -82,12 +145,10 @@ def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
             )
         return verbose_json_to_srt(result, index_start=idx_start, offset_sec=offset_sec)
 
-    # Write source to disk
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp_in:
         tmp_in.write(file_bytes)
         src_path = tmp_in.name
 
-    # Get duration via ffprobe
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", src_path],
@@ -96,7 +157,7 @@ def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
     try:
         total_secs = float(probe.stdout.strip())
     except Exception:
-        total_secs = 7200  # fallback: 2 hours
+        total_secs = 7200
 
     n_chunks  = max(1, math.ceil(total_secs / CHUNK_SECS))
     srt_parts = []
@@ -106,7 +167,6 @@ def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
         start_sec  = i * CHUNK_SECS
         chunk_path = src_path + f"_chunk{i}.mp3"
 
-        # Extract + compress chunk with ffmpeg
         r = subprocess.run(
             ["ffmpeg", "-y", "-i", src_path,
              "-ss", str(start_sec), "-t", str(CHUNK_SECS),
@@ -114,7 +174,6 @@ def transcribe_audio(openai_client: OpenAI, file_bytes: bytes, ext: str,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-        # Stop if chunk is missing or too small (past end of file)
         if r.returncode != 0 or not os.path.exists(chunk_path) \
                 or os.path.getsize(chunk_path) < 2000:
             if os.path.exists(chunk_path):
@@ -258,7 +317,7 @@ def format_locations_sheet(locations, episode_name):
     return "\n".join(lines)
 
 
-# ── Main UI ───────────────────────────────────────────────────────────────────
+# Main UI
 st.markdown("---")
 col_upload, col_meta = st.columns([3, 2])
 
@@ -274,6 +333,15 @@ with col_upload:
             st.warning(f"File is {size_mb:.1f} MB - maximum is 300 MB.")
         else:
             st.success(f"{uploaded_file.name}  ({size_mb:.1f} MB) - ready")
+
+    st.markdown("")
+    script_file = st.file_uploader(
+        "Upload Original Script (optional)",
+        type=["docx", "txt"],
+        help="Upload the .docx or .txt script used for recording. Claude will use it to fix any Whisper transcription errors.",
+    )
+    if script_file:
+        st.success(f"Script uploaded: {script_file.name} - transcription will be auto-corrected")
 
 with col_meta:
     episode_name = st.text_input(
@@ -301,12 +369,20 @@ with col_meta:
         if not uploaded_file:
             st.caption("Upload an audio file to get started")
 
-# ── Processing ────────────────────────────────────────────────────────────────
+# Processing
 if file_ok and generate_clicked:
 
     safe_name = re.sub(r"[^\w\-]", "_", episode_name) if episode_name else "episode"
     st.markdown("---")
     st.markdown("#### Processing")
+
+    script_text = ""
+    if script_file:
+        try:
+            script_text = extract_script_text(script_file)
+        except Exception as e:
+            st.warning(f"Could not read script file: {e}. Continuing without correction.")
+            script_text = ""
 
     # STEP 1 - Transcribe
     step1 = st.status("Step 1 - Transcribing audio with OpenAI Whisper...", expanded=True)
@@ -334,14 +410,31 @@ if file_ok and generate_clicked:
             st.error(f"Whisper error: {e}")
             st.stop()
 
+    # STEP 1.5 - Correct transcript using original script
+    if script_text:
+        step1b = st.status("Step 1.5 - Correcting transcript against original script...", expanded=True)
+        with step1b:
+            try:
+                or_client = OpenAI(
+                    base_url="https://openrouter.ai/api/v1", api_key=openrouter_key
+                )
+                n_blocks = len([b for b in srt_content.split("\n\n") if b.strip()])
+                st.write(f"Checking {n_blocks} subtitle blocks for transcription errors...")
+                srt_content = correct_transcript_with_script(or_client, srt_content, script_text)
+                step1b.update(label="Step 1.5 - Transcript corrected!", state="complete")
+            except Exception as e:
+                step1b.update(label="Step 1.5 - Correction skipped", state="error")
+                st.warning(f"Script correction failed ({e}), continuing with raw transcript.")
+
     # STEP 2 - Enrich with Claude
     step2 = st.status("Step 2 - Generating Morphic prompts with Claude...", expanded=True)
     annotated_srt = ""
     with step2:
         try:
-            or_client = OpenAI(
-                base_url="https://openrouter.ai/api/v1", api_key=openrouter_key
-            )
+            if not script_text:
+                or_client = OpenAI(
+                    base_url="https://openrouter.ai/api/v1", api_key=openrouter_key
+                )
             segments = parse_srt(srt_content)
             total    = len(segments)
             st.write(f"Found {total} subtitle segments - enriching in batches...")
@@ -377,7 +470,7 @@ if file_ok and generate_clicked:
             step3.update(label="Step 3 - Extraction failed", state="error")
             st.error(f"Error: {e}")
 
-    # ── Downloads ──────────────────────────────────────────────────────────────
+    # Downloads
     st.markdown("---")
     st.markdown("### Download Your Files")
     dcol1, dcol2, dcol3 = st.columns(3)
@@ -414,7 +507,7 @@ if file_ok and generate_clicked:
             st.button("Locations Sheet", disabled=True, use_container_width=True)
             st.caption("Not available")
 
-    # ── Preview ────────────────────────────────────────────────────────────────
+    # Preview
     st.markdown("---")
     st.markdown("### Preview")
     tab_srt, tab_chars, tab_locs = st.tabs(["Annotated SRT", "Characters & Costumes", "Locations"])
