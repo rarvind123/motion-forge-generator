@@ -559,10 +559,10 @@ if st.session_state.annotated_srt:
         preview = _srt[:4000]
         if len(_srt) > 4000:
             preview += "\n\nâ¦ (truncated â download for full file)"
-        st.text_area("", value=preview, height=420, label_visibility="collapsed")
+        st.text_area("Morphic Script Preview", value=preview, height=420, label_visibility="collapsed")
 
     with tab_chars:
-        st.text_area("", value=_chars or "No data", height=420, label_visibility="collapsed")
+        st.text_area("Characters Preview", value=_chars or "No data", height=420, label_visibility="collapsed")
 
     with tab_locs:
-        st.text_area("", value=_locs or "No data", height=420, label_visibility="collapsed")
+        st.text_area("Locations Preview", value=_locs or "No data", height=420, label_visibility="collapsed")
